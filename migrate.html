@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firebase → R2 migration</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<style>
+body{font-family:Helvetica,Arial,sans-serif;max-width:760px;margin:30px auto;padding:0 16px;background:#111;color:#eee}
+h1{font-size:24px}.card{background:#1c1c1e;border-radius:10px;padding:16px;margin:14px 0}
+button{border:0;border-radius:30px;padding:10px 18px;font-weight:700;cursor:pointer;margin:4px 6px 4px 0}
+button:disabled{opacity:.4}label{display:block;margin:8px 0}
+#log{white-space:pre-wrap;font:12px/1.5 monospace;background:#000;border-radius:8px;padding:10px;height:300px;overflow:auto}
+#bar{height:10px;background:#333;border-radius:6px;overflow:hidden}#bar i{display:block;height:100%;width:0;background:#ea580c}
+.m{color:#999;font-size:13px}
+</style></head><body>
+<h1>Firebase → R2 photo copy</h1>
+<p class="m">Copies only. Nothing is deleted or changed in Firebase. Safe to run again: files already in R2 are skipped.</p>
+
+<div class="card"><b>1. Sign in (admin Google account)</b><br>
+<button id="in">Sign in with Google</button><span id="who" class="m"></span></div>
+
+<div class="card"><b>2. What to copy</b>
+<label><input type="checkbox" id="cP" checked> Product, Gallery and Hero photos → public bucket (<code>p/ g/ h/</code>)</label>
+<label><input type="checkbox" id="cO" checked> Order files (design PNG + shirt snapshot) → <b>private</b> bucket (<code>orders/</code>)</label>
+<button id="chk" disabled>Check what is in Firebase</button>
+<button id="go" disabled style="background:#ea580c;color:#fff">Start copy</button>
+<div id="bar"><i></i></div>
+<div class="m" id="st" style="margin-top:6px"></div>
+</div>
+<div id="log"></div>
+
+<script>
+var R2_API='https://api.customiza.in'; /* same value as in the admin file */
+firebase.initializeApp({apiKey:"AIzaSyDEQ39jNypcqjNvK3VF9awPPHKo4AxLlNc",authDomain:"maniac-711a2.firebaseapp.com",projectId:"maniac-711a2",storageBucket:"maniac-711a2.firebasestorage.app",messagingSenderId:"717082911075",appId:"1:717082911075:web:7419d1b91a121009feb356"});
+var AUTH=firebase.auth(),FS=firebase.firestore(),$=function(i){return document.getElementById(i)},ST={fail:0,ok:0,skip:0,total:0,done:0};
+function log(t){var l=$('log');l.textContent+=t+'\n';l.scrollTop=l.scrollHeight}
+function prog(){$('bar').firstChild.style.width=(ST.total?Math.round(ST.done/ST.total*100):0)+'%';$('st').textContent=ST.done+' / '+ST.total+' files · copied '+ST.ok+' · skipped '+ST.skip+' · failed '+ST.fail}
+async function tok(){return AUTH.currentUser.getIdToken()}
+async function api(path,opt){opt=opt||{};opt.headers=Object.assign({Authorization:'Bearer '+await tok()},opt.headers||{});var r=await fetch(R2_API+path,opt),j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+$('in').onclick=function(){AUTH.signInWithPopup(new firebase.auth.GoogleAuthProvider()).catch(function(e){log('Sign in failed: '+(e.code||e.message))})};
+AUTH.onAuthStateChanged(function(u){$('who').textContent=u?' Signed in as '+u.email:'';$('chk').disabled=$('go').disabled=!u});
+
+function extOf(t){t=(t||'').toLowerCase();return t.indexOf('png')>-1?'png':t.indexOf('webp')>-1?'webp':t.indexOf('gif')>-1?'gif':'jpg'}
+async function dataToBlob(d){var r=await fetch(d);return r.blob()}
+/* Build the list of every file to copy: {bucket,key,src(dataURL)} */
+async function plan(){
+  var jobs=[],map={},omap={};
+  if($('cP').checked){
+    log('Reading products…');var ps=await FS.collection('products').get(),ids={};
+    ps.forEach(function(d){var x=d.data();if(x.kind==='design'||!x.hasImg)return;ids[d.id]=x.kind||'product'});
+    log(Object.keys(ids).length+' items with photos (old designs are skipped, stickers live in R2 already).');
+    var keys=Object.keys(ids);
+    for(var i=0;i<keys.length;i+=20){
+      await Promise.all(keys.slice(i,i+20).map(async function(id){
+        try{var s=await FS.collection('productImgs').doc(id).get();if(!s.exists){log('! no photo doc for '+id);return}
+          var o=s.data(),f=ids[id]==='gallery'?'g':ids[id]==='hero'?'h':'p',list=[];
+          if(o.img)list.push(o.img);(o.imgs||[]).forEach(function(z){if(z)list.push(z)});
+          map[id]={kind:ids[id],files:[]};
+          list.forEach(function(d,n){var e=extOf((d.match(/^data:([^;,]+)/)||[])[1]),key=f+'/'+id+'/'+(n?n:'main')+'.'+e;map[id].files.push(key);jobs.push({bucket:'public',key:key,src:d})})
+        }catch(e){log('! '+id+': '+e.message)}}))}
+  }
+  if($('cO').checked){
+    log('Reading orders…');var os=await FS.collection('orders').get();log(os.size+' orders.');
+    for(var d of os.docs){var x=d.data(),m=omap[d.id]={};
+      if(x.preview&&String(x.preview).indexOf('data:')===0){var k='orders/'+d.id+'/shirt.'+extOf((x.preview.match(/^data:([^;,]+)/)||[])[1]);m.shirt=k;jobs.push({bucket:'private',key:k,src:x.preview})}
+      try{var f=await FS.collection('orders').doc(d.id).collection('files').doc('design').get();
+        if(f.exists&&f.data().png&&String(f.data().png).indexOf('data:')===0){var k2='orders/'+d.id+'/design.'+extOf((f.data().png.match(/^data:([^;,]+)/)||[])[1]);m.design=k2;jobs.push({bucket:'private',key:k2,src:f.data().png})}
+      }catch(e){log('! order '+d.id+' files: '+e.message)}}
+  }
+  return {jobs:jobs,map:map,omap:omap}
+}
+$('chk').onclick=async function(){this.disabled=true;ST={fail:0,ok:0,skip:0,total:0,done:0};
+  try{var p=await plan();var pub=p.jobs.filter(function(j){return j.bucket==='public'}).length;log('Found '+p.jobs.length+' files in Firebase ('+pub+' public, '+(p.jobs.length-pub)+' private).');ST.total=p.jobs.length;prog()}catch(e){log('Error: '+e.message)}
+  this.disabled=false};
+async function existing(bucket,prefixes){var s={};for(var i=0;i<prefixes.length;i++){var j=await api('/mig/keys?bucket='+bucket+'&prefix='+encodeURIComponent(prefixes[i]));j.keys.forEach(function(k){s[k]=1})}return s}
+async function putOne(j){var b=await dataToBlob(j.src);var r=await api('/mig/put?bucket='+j.bucket+'&key='+encodeURIComponent(j.key),{method:'PUT',headers:{'Content-Type':b.type||'application/octet-stream'},body:b});return r}
+$('go').onclick=async function(){var btn=this;btn.disabled=$('chk').disabled=true;ST={fail:0,ok:0,skip:0,total:0,done:0};
+  try{
+    var p=await plan();ST.total=p.jobs.length;prog();
+    log('Checking what R2 already has…');
+    var have={pub:{},priv:{}};
+    if(p.jobs.some(function(j){return j.bucket==='public'}))have.pub=await existing('public',['p/','g/','h/']);
+    if(p.jobs.some(function(j){return j.bucket==='private'})){try{have.priv=await existing('private',['orders/'])}catch(e){log('PRIVATE bucket problem: '+e.message+'\nOrder files will be skipped. Add the PRIVATE binding on the Worker and run again.');p.jobs=p.jobs.filter(function(j){return j.bucket!=='private'});ST.total=p.jobs.length}}
+    var q=p.jobs.slice(),run=async function(){while(q.length){var j=q.shift();
+      if((j.bucket==='public'?have.pub:have.priv)[j.key]){ST.skip++;ST.done++;prog();continue}
+      try{await putOne(j);ST.ok++}catch(e){ST.fail++;log('FAILED '+j.key+': '+e.message)}ST.done++;prog()}};
+    await Promise.all([run(),run(),run()]);
+    /* save id -> file maps so the next step (switching the shop/admin) knows where everything is */
+    if(Object.keys(p.map).length)await api('/mig/put?bucket=public&key=migration/media-map.json',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(p.map)});
+    if(Object.keys(p.omap).length&&p.jobs.some(function(j){return j.bucket==='private'}))await api('/mig/put?bucket=private&key=orders/_map.json',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(p.omap)});
+    log(ST.fail?'Finished with '+ST.fail+' failures. Run again to retry only those.':'Done. Everything copied. Firebase was not changed.');
+  }catch(e){log('Error: '+e.message)}
+  btn.disabled=$('chk').disabled=false};
+</script></body></html>
